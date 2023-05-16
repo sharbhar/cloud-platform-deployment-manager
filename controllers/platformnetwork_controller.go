@@ -551,7 +551,6 @@ func (r *PlatformNetworkReconciler) ReconcileResource(client *gophercloud.Servic
 		}
 
 		if r.statusUpdateRequired(instance, oldStatus) {
-			instance.Status.DeploymentScope = "bootstrap"
 			err2 := r.Client.Status().Update(context.TODO(), instance)
 			if err2 != nil {
 				logPlatformNetwork.Error(err2, "failed to update platform network status")
