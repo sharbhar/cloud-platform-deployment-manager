@@ -36,6 +36,10 @@ spec:
       jsonPath: .status.inSync
       name: insync
       type: boolean
+    - description: The current deploymentScope state.
+      jsonPath: .status.deploymentScope
+      name: scope
+      type: string
     - description: The current reconciliation state.
       jsonPath: .status.reconciled
       name: reconciled
@@ -1048,6 +1052,14 @@ spec:
               defaults:
                 description: Defaults defines the configuration attributed collected
                   before applying any user configuration values.
+                type: string
+              deploymentScope:
+                default: bootstrap
+                description: DeploymentScope defines whether the resource has been
+                  deployed on the initial setup or during an update.
+                enum:
+                - bootstrap
+                - principal
                 type: string
               id:
                 description: ID defines the system assigned unique identifier.  This
