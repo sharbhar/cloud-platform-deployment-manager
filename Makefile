@@ -120,6 +120,10 @@ build: generate fmt vet ## Build manager binary.
 tools: generate fmt vet ## Build deployctl binary.
 	go build -ldflags "${DEPLOY_LDFLAGS}" -gcflags "${GOBUILD_GCFLAGS}" -o bin/deployctl cmd/deployctl/main.go
 
+.PHONY: deployctl
+tools: generate fmt ## Build deployctl binary.
+	go build -ldflags "${DEPLOY_LDFLAGS}" -gcflags "${GOBUILD_GCFLAGS}" -o bin/deployctl cmd/deployctl/main.go
+
 # Run against the configured Kubernetes cluster in ~/.kube/config
 .PHONY: run
 run: build
@@ -131,7 +135,7 @@ endif
 
 .PHONY: docker-build
 docker-build: test ## Build docker image with the manager.
-	docker build . --no-cache -t ${IMG} --target ${DOCKER_TARGET} --build-arg "GOBUILD_GCFLAGS=${GOBUILD_GCFLAGS}"
+	docker build . -t ${IMG} --target ${DOCKER_TARGET} --build-arg "GOBUILD_GCFLAGS=${GOBUILD_GCFLAGS}"
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -211,7 +215,7 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 
 # Build the builder image
 builder-build:
-	docker build . --no-cache -t ${BUILDER_IMG} -f Dockerfile.builder
+	docker build . -t ${BUILDER_IMG} -f Dockerfile.builder
 
 builder-run: builder-build
 	docker run -v /var/run/docker.sock:/var/run/docker.sock \
