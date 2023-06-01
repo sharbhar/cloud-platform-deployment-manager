@@ -120,6 +120,10 @@ build: generate fmt vet ## Build manager binary.
 tools: generate fmt vet ## Build deployctl binary.
 	go build -ldflags "${DEPLOY_LDFLAGS}" -gcflags "${GOBUILD_GCFLAGS}" -o bin/deployctl cmd/deployctl/main.go
 
+.PHONY: deployctl
+tools: generate fmt ## Build deployctl binary.
+	go build -ldflags "${DEPLOY_LDFLAGS}" -gcflags "${GOBUILD_GCFLAGS}" -o bin/deployctl cmd/deployctl/main.go
+
 # Run against the configured Kubernetes cluster in ~/.kube/config
 .PHONY: run
 run: build
