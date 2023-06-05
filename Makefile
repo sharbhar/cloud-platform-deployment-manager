@@ -117,7 +117,7 @@ build: generate fmt golangci vet ## Build manager binary.
 	go build -gcflags "${GOBUILD_GCFLAGS}" -o bin/manager main.go
 
 .PHONY: tools
-tools: generate fmt golangci vet ## Build deployctl binary.
+tools: generate fmt vet ## Build deployctl binary.
 	go build -ldflags "${DEPLOY_LDFLAGS}" -gcflags "${GOBUILD_GCFLAGS}" -o bin/deployctl cmd/deployctl/main.go
 
 # Run against the configured Kubernetes cluster in ~/.kube/config
