@@ -1080,6 +1080,23 @@ func (r *SystemReconciler) ReconcileSystemFinal(client *gophercloud.ServiceClien
 	return nil
 }
 
+// Fixes extra certs from the response of the current configuration according to the certs specified in the profile.
+func FixCertsToManage(specCerts, currentCerts *starlingxv1.CertificateList) starlingxv1.CertificateList {
+	var res starlingxv1.CertificateList
+	certificateMap := make(map[string]bool)
+
+	//signature of spec certs are empty at this point so secrets are checked rather than signatures
+	for _, cert := range *specCerts {
+		certificateMap[cert.Secret] = true
+	}
+	for _, cert := range *currentCerts {
+		if _, ok := certificateMap[cert.Secret]; ok {
+			res = append(res, cert)
+		}
+	}
+	return res
+}
+
 // ReconcileRequired determines whether reconciliation is allowed/required on
 // the System resource.  Reconciliation is required if there is a difference
 // between the configured Spec and the current system state.  Reconciliation
@@ -1100,6 +1117,12 @@ func (r *SystemReconciler) ReconcileRequired(instance *starlingxv1.System, spec 
 	current, err := starlingxv1.NewSystemSpec(*info)
 	if err != nil {
 		return err, false
+	}
+
+	// We need to remove the runtime installed certificated from the current
+	if spec.Certificates != nil && current.Certificates != nil {
+		res := FixCertsToManage(spec.Certificates, current.Certificates)
+		current.Certificates = &res
 	}
 
 	if spec.DeepEqual(current) {
@@ -1408,7 +1431,12 @@ func (r *SystemReconciler) ReconcileResource(client *gophercloud.ServiceClient, 
 		if factory {
 			// Update the resource default updated to prevent the next update,
 			// it will be checked in UpdateDefaultsRequired.
-			err := r.CloudManager.SetResourceDefaultUpdated(instance.Namespace, instance.Name, true)
+			err := r.CloudManager.SetFactoryResourceDataUpdated(
+				instance.Namespace,
+				instance.Name,
+				"default",
+				true,
+			)
 			if err != nil {
 				return err
 			}
@@ -1494,17 +1522,11 @@ func (r *SystemReconciler) StopAfterInSync() bool {
 // Update ReconcileAfterInSync in instance
 // ReconcileAfterInSync value will be:
 // "true" if deploymentScope is "principal" because it is day 2 operation (update configuration)
-// "true" if factory install is not finalized
 // "false" if deploymentScope is "bootstrap"
 // Then reflect these values to cluster object
 // It is expected that instance.Status.Deployment scope is already updated by
 // UpdateDeploymentScope at this point.
 func (r *SystemReconciler) UpdateConfigStatus(instance *starlingxv1.System, ns string) (err error) {
-
-	factory, err := r.CloudManager.GetFactoryInstall(ns)
-	if err != nil {
-		return err
-	}
 
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		err := r.Client.Get(context.TODO(), types.NamespacedName{
@@ -1516,10 +1538,9 @@ func (r *SystemReconciler) UpdateConfigStatus(instance *starlingxv1.System, ns s
 		}
 
 		// "true"  if scope is "principal" because it is day 2 operation (update configuration)
-		// "true"  if the factory install is not finalized
 		// "false" if scope is "bootstrap" or None
 		afterInSync, ok := instance.Annotations[cloudManager.ReconcileAfterInSync]
-		if instance.Status.DeploymentScope == cloudManager.ScopePrincipal || factory {
+		if instance.Status.DeploymentScope == cloudManager.ScopePrincipal {
 			if !ok || afterInSync != "true" {
 				instance.Annotations[cloudManager.ReconcileAfterInSync] = "true"
 			}
@@ -1552,14 +1573,14 @@ func (r *SystemReconciler) UpdateConfigStatus(instance *starlingxv1.System, ns s
 		if instance.Status.ObservedGeneration != instance.ObjectMeta.Generation {
 			// The configuration is updated
 			if instance.Status.ObservedGeneration == 0 &&
-				instance.Status.Reconciled || !factory {
+				instance.Status.Reconciled {
 				// Case: DM upgrade in reconciled node
 				instance.Status.ConfigurationUpdated = false
 			} else {
-				// Case: Fresh install/ factory install or Day-2 operation
+				// Case: Fresh install or Day-2 operation
 				instance.Status.ConfigurationUpdated = true
 
-				if instance.Status.DeploymentScope == cloudManager.ScopePrincipal || factory {
+				if instance.Status.DeploymentScope == cloudManager.ScopePrincipal {
 					instance.Status.Reconciled = false
 					// Update strategy required status for strategy monitor
 					r.CloudManager.UpdateConfigVersion()
@@ -1593,6 +1614,47 @@ func clean_deprecated_certificates(certs starlingxv1.CertificateList) starlingxv
 		}
 	}
 	return filteredCerts
+}
+
+// During factory install, the reconciled status is expected to be updated to
+// false to unblock the configuration as the day 1 configuration.
+// UpdateStatusForFactoryInstall updates the status by checking the factory
+// install data.
+func (r *SystemReconciler) UpdateStatusForFactoryInstall(
+	ns string,
+	instance *starlingxv1.System,
+) error {
+	reconciledUpdated, err := r.CloudManager.GetFactoryResourceDataUpdated(
+		ns,
+		instance.Name,
+		"reconciled",
+	)
+	if err != nil {
+		return err
+	}
+
+	if !reconciledUpdated {
+		instance.Status.Reconciled = false
+		err = r.Client.Status().Update(context.TODO(), instance)
+		if err != nil {
+			return err
+		}
+		err = r.CloudManager.SetFactoryResourceDataUpdated(
+			ns,
+			instance.Name,
+			"reconciled",
+			true,
+		)
+		if err != nil {
+			return err
+		}
+		r.ReconcilerEventLogger.NormalEvent(
+			instance,
+			common.ResourceUpdated,
+			"Set Reconciled false for factory install",
+		)
+	}
+	return nil
 }
 
 // Reconcile reads that state of the cluster for a SystemNamespace object and makes
@@ -1665,15 +1727,21 @@ func (r *SystemReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		return reconcile.Result{}, err
 	}
 
+	factory, err := r.CloudManager.GetFactoryInstall(request.Namespace)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if factory {
+		err := r.UpdateStatusForFactoryInstall(request.Namespace, instance)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
 	// The status reaches its desired status post reconciled
 	if instance.Status.ObservedGeneration == instance.ObjectMeta.Generation &&
 		instance.Status.Reconciled &&
 		platformClient != nil {
-
-		factory, err := r.GetFactoryInstall(request.Namespace)
-		if err != nil {
-			return reconcile.Result{}, err
-		}
 
 		if !scope_updated && !factory {
 			logSystem.V(2).Info("reconcile finished, desired state reached after reconciled.")

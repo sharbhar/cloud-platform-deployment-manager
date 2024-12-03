@@ -1,3 +1,4 @@
+---
 # SPDX-License-Identifier: Apache-2.0
 # Copyright(c) 2021-2024 Wind River Systems, Inc.
 - name: Deployment Manager Playbook
@@ -29,6 +30,9 @@
     - set_fact:
         manager_app_chart: "{{ manager_app_chart | default('/usr/local/share/applications/helm/deployment-manager-*.tgz') }}"
 
+    - set_fact:
+        dm_monitor_playbook: "{{ dm_monitor_playbook | default('/usr/local/share/applications/playbooks/dm-monitor-book.yaml') }}"
+
     - block:
       # Information to be used at final DM checks.
         - name: Get host name
@@ -43,11 +47,18 @@
             awk '$2 ~ /^distributed_cloud_role/ {print $4}'
           register: get_distributed_cloud_role
 
+        - name: Get software version
+          shell: >-
+            source /etc/platform/openrc; system show |
+            awk '$2 ~ /^software_version/ {print $4}'
+          register: get_software_version
+
         - name: Show dc_role and hostname
           debug:
             msg:
             - "hostname: {{get_host_name.stdout}}"
             - "dc_role: {{ get_distributed_cloud_role.stdout }}"
+            - "software_version: {{ get_software_version.stdout }}"
 
     - block:
       # Copy required files up to the target host if this playbook is being
@@ -154,9 +165,20 @@
         path: /etc/platform/.unlock_ready
       register: is_unlock_ready
 
-    - name: Set reconfiguration fact
+    - name: Check if host is provisioned
+      shell: |
+        source /etc/platform/openrc;
+        system host-show "{{ get_host_name.stdout}}" | awk '$2 ~ /^invprovision/ {print $4}'
+      register: get_host_invprovision
+
+    - name: Fail to update the deployment manager when host is upgrading
+      fail:
+        msg: "Fail to update the deployment manager when the host is upgrading"
+      when: get_host_invprovision.stdout == 'upgrading'
+
+    - name: Set initial configuration fact
       set_fact:
-        reconfig_flag: "{{ true if (is_unlock_ready.stat.exists == True)
+        initial_config_done: "{{ true if (get_host_invprovision.stdout == 'provisioned')
                         else false }}"
 
     - name: Mark the bootstrap as finalized
@@ -164,7 +186,7 @@
         path: "{{ config_permdir }}/.bootstrap_finalized"
         state: touch
       become: yes
-      when: not reconfig_flag
+      when: not initial_config_done
 
     - block:
       - name: Search for the pod of the Deployment Manager
@@ -176,74 +198,137 @@
 
       - debug:
           msg: "{{ deployment_manager_pod_name.stdout }}"
-      when: reconfig_flag
+      when: initial_config_done
 
-    - name: Check deployment-manager app status
-      shell: source /etc/platform/openrc; system application-list --nowrap | grep deployment-manager | awk '{ print $10 }'
-      register: dm_app_status
-
-    - name: Fail if the deployment manager application staus is not ready to apply
-      fail:
-        msg: >
-          Deployment manager application is not in expected status:
-          {{ dm_app_status.stdout }}
-      when:
-        - dm_app_status.stdout_lines |length > 0
-        - dm_app_status.stdout != 'applied'
-        - dm_app_status.stdout != 'uploaded'
-        - dm_app_status.stdout != 'applying'
-
-    - name: Upload deployment manager
-      block:
-      - name: Find deployment-manager app helm-chart in application directory
-        find:
-          paths: "{{ manager_app_chart | dirname }}"
-          patterns: 'deployment-manager*.tgz'
-        register: app_helm_chart
-
-      - name: Fail deployment-manager app helm-chart does not exists
-        fail:
-          msg: "Deployment manger helm-chart does not exists in application directory"
-        when: (app_helm_chart.files[0].path | length == 0)
-
-      - name: Upload deployment-manager app Helm Chart
-        shell: source /etc/platform/openrc; system application-upload {{ app_helm_chart.files[0].path }}
-
-      - name: Wait deployment-manager app to become uploaded
+    - block:
+      # Install Deployment-Manager as System Application
+      - name: Check deployment-manager app status
         shell: source /etc/platform/openrc; system application-list --nowrap | grep deployment-manager | awk '{ print $10 }'
-        register: app_upload_status
-        retries: 10
-        delay: 6
-        until: ("uploaded" in app_upload_status.stdout)
+        register: dm_app_status
+
+      - name: Fail if the deployment manager application staus is not ready to apply
+        fail:
+          msg: >
+            Deployment manager application is not in expected status:
+            {{ dm_app_status.stdout }}
+        when:
+          - dm_app_status.stdout_lines |length > 0
+          - dm_app_status.stdout != 'applied'
+          - dm_app_status.stdout != 'uploaded'
+          - dm_app_status.stdout != 'applying'
+
+      - name: Upload deployment manager
+        block:
+        - name: Find deployment-manager app helm-chart in application directory
+          find:
+            paths: "{{ manager_app_chart | dirname }}"
+            patterns: 'deployment-manager*.tgz'
+          register: app_helm_chart
+
+        - name: Fail deployment-manager app helm-chart does not exists
+          fail:
+            msg: "Deployment manger helm-chart does not exists in application directory"
+          when: (app_helm_chart.files[0].path | length == 0)
+
+        - name: Upload deployment-manager app Helm Chart
+          shell: source /etc/platform/openrc; system application-upload {{ app_helm_chart.files[0].path }}
+
+        - name: Wait deployment-manager app to become uploaded
+          shell: source /etc/platform/openrc; system application-list --nowrap | grep deployment-manager | awk '{ print $10 }'
+          register: app_upload_status
+          retries: 10
+          delay: 6
+          until: ("uploaded" in app_upload_status.stdout)
+          ignore_errors: yes
+
+        - name: Fail if deployment-manager app upload fails
+          fail:
+            msg: "The upload of deployment-manager system app has failed.
+                  Expected 'uploaded' state but the app is in
+                  '{{ app_upload_status.stdout }}' state "
+          when: not ("uploaded" in app_upload_status.stdout)
+
+        when: dm_app_status.stdout_lines|length == 0
+
+      - name: Apply deployment-manager app
+        shell: source /etc/platform/openrc; system application-apply deployment-manager
+        when: dm_app_status.stdout != 'applied' and dm_app_status.stdout != 'applying'
+
+      - name: Wait deployment-manager app to become applied
+        shell: source /etc/platform/openrc; system application-list --nowrap | grep deployment-manager | awk '{ print $10 }'
+        register: app_apply_status
+        retries: 30
+        delay: 10
+        until: ("applied" in app_apply_status.stdout)
         ignore_errors: yes
 
-      - name: Fail if deployment-manager app upload fails
+      - name: Fail if deployment-manager app apply fails
         fail:
-          msg: "The upload of deployment-manager system app has failed.
-                Expected 'uploaded' state but the app is in
-                '{{ app_upload_status.stdout }}' state "
-        when: not ("uploaded" in app_upload_status.stdout)
+          msg: "The apply of DM system app has failed.
+                Expected 'applied' state but the app is in
+                '{{ app_apply_status.stdout }}' state."
+        when: not ("applied" in app_apply_status.stdout)
 
-      when: dm_app_status.stdout_lines|length == 0
+      when: get_software_version.stdout >= "24.09"
 
-    - name: Apply deployment-manager app
-      shell: source /etc/platform/openrc; system application-apply deployment-manager
-      when: dm_app_status.stdout != 'applied' and dm_app_status.stdout != 'applying'
+    - block:
+      # Remove webhook and webhook service
+      - name: Search webhook configurations for v1
+        shell: |
+          kubectl get ValidatingWebhookConfigurations validating-webhook-configuration --no-headers | awk 'NR == 1 { print $1 }'
+        environment:
+          KUBECONFIG: "/etc/kubernetes/admin.conf"
+        ignore_errors: yes
+        register: validation_webhook
 
-    - name: Wait deployment-manager app to become applied
-      shell: source /etc/platform/openrc; system application-list --nowrap | grep deployment-manager | awk '{ print $10 }'
-      register: app_apply_status
-      retries: 30
-      delay: 10
-      until: ("applied" in app_apply_status.stdout)
-      ignore_errors: yes
+      - name: Query for validating webhook configuration
+        shell: |
+          grep -iq 'validating-webhook-configuration' <<< {{ validation_webhook.stdout_lines }}
+        ignore_errors: yes
+        register: webhook_config_exists
 
-    - name: Fail if deployment-manager app apply fails
-      fail:
-        msg: "The apply of DM system app has failed.
-              Expected 'applied' state but the app is in
-              '{{ app_apply_status.stdout }}' state."
-      when: not ("applied" in app_apply_status.stdout)
+      - name: Delete validating webhook configuration
+        shell: |
+          kubectl delete ValidatingWebhookConfigurations validating-webhook-configuration
+        environment:
+          KUBECONFIG: "/etc/kubernetes/admin.conf"
+        when: webhook_config_exists.rc == 0
+
+      - name: Search webhook service for v1
+        shell: |
+          kubectl get svc webhook-server-service -n platform-deployment-manager --no-headers | awk 'NR == 1 { print $1 }'
+        environment:
+          KUBECONFIG: "/etc/kubernetes/admin.conf"
+        register: webhook_service
+
+      - name: Query for webhook-server-service
+        shell: |
+          grep -iq 'webhook-server-service' <<< {{ webhook_service.stdout_lines }}
+        ignore_errors: yes
+        register: webhook_service_exists
+
+      - name: Delete webhook-server-service
+        shell: |
+          kubectl delete svc webhook-server-service -n platform-deployment-manager
+        environment:
+          KUBECONFIG: "/etc/kubernetes/admin.conf"
+        when: webhook_service_exists.rc == 0
+
+      # Install Helm Based Deployment Manager
+      - name: Install Helm Based Deployment Manager
+        shell: KUBECONFIG=/etc/kubernetes/admin.conf /usr/sbin/helm upgrade --install deployment-manager {% if helm_chart_overrides is defined %}--values {{ helm_chart_overrides }}{% endif %} {{ manager_chart }}
+
+      # Install or Upgrade DM-Monitor
+      - name: "Install or Upgrade Helm Based DM-monitor"
+        shell: "ansible-playbook {{ dm_monitor_playbook }}"
+        become: yes
+        ignore_errors: yes
+        when: dm_monitor_playbook
+
+      when:
+        - get_software_version.stdout < "24.09"
+        - "'subcloud' in get_distributed_cloud_role.stdout"
+        - user_uploaded_artifacts is false
 
     # Delete old Deployment Manager pod if it was reinstalled,
     # the pod to delete may already be terminated by helm
@@ -299,6 +384,14 @@
             deploy_config: "/home/{{ ansible_ssh_user }}/deployment-config.yaml"
           when: inventory_hostname != 'localhost'
 
+        - name: Check for the presence of the subcloud enrollment completed
+          stat:
+            path: /var/run/.subcloud_enrollment_completed
+          register: subcloud_enrollment_status
+
+        - set_fact:
+            subcloud_enrollment: "{{ subcloud_enrollment_status.stat.exists }}"
+
         - name: Configure required region value if not systemcontroller
           block:
           - name: Get region name from environment
@@ -336,19 +429,72 @@
           failed_when: false
           register: scope_principal
 
+        - name: Pre-check and process for subcloud enrollment
+          block:
+          - name: Fail if system subcloud enrollment but have principal in scope
+            fail:
+              msg: "Principal scope cannot used in subcloud enrollment."
+            when: scope_principal.stdout_lines | length > 0
+
+          - name: Retrieve all system resource names
+            command: kubectl -n deployment get systems -o jsonpath='{.items[*].metadata.name}'
+            environment:
+              KUBECONFIG: "/etc/kubernetes/admin.conf"
+            register: system_resource_names
+
+          - name: Parse the system resource names into a list
+            set_fact:
+              system_resources: "{{ system_resource_names.stdout.split() }}"
+            when: system_resource_names.stdout | length > 0
+
+          - name: Debug the list of system resource names
+            debug:
+              msg: "System resources to be deleted: {{ system_resources }}"
+            when: system_resources is defined
+
+          - name: Delete all system resources
+            command: |
+              kubectl -n deployment delete system {{ item }}
+            loop: "{{ system_resources }}"
+            environment:
+              KUBECONFIG: "/etc/kubernetes/admin.conf"
+            when: system_resources is defined and system_resources | length > 0
+          when: subcloud_enrollment
+
         # Check if there is any strategy-related alarm
         - name: Check if a VIM strategy is in progress
           shell: |
             source /etc/platform/openrc; fm alarm-list | grep 900.
           failed_when: false
           register: strategy_alarms
+          when: scope_principal.stdout_lines | length > 0
 
         - name: Fail if there is a strategy in progress during a Day-2 operation
           fail:
             msg:
               - "VIM Strategy in progress."
               - "Wait until all the strategies are cleared before applying the system configuration update."
-          when: ( scope_principal.stdout_lines | length > 0 and strategy_alarms.stdout != "")
+          when:
+            - scope_principal.stdout_lines | length > 0
+            - strategy_alarms.stdout != ""
+
+        - name: Append config map for subcloud enrollment
+          blockinfile:
+            path: "{{ deploy_config }}"
+            block: |
+
+              ---
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: factory-install
+                namespace: deployment
+              data:
+                factory-installed: "true"
+                factory-config-finalized: "false"
+            marker: ""
+            insertafter: EOF
+          when: subcloud_enrollment
 
         - name: Apply Deployment Configuration File
           shell: KUBECONFIG=/etc/kubernetes/admin.conf /bin/kubectl apply -f {{ deploy_config }}
@@ -371,6 +517,13 @@
         - wait_for:
             timeout: 5
             msg: Waiting after apply DM config
+
+        - name: Restart the deployment manager if subcloud enrollment
+          command: >-
+            kubectl -n platform-deployment-manager delete pods --selector control-plane=controller-manager
+          environment:
+            KUBECONFIG: "/etc/kubernetes/admin.conf"
+          when: subcloud_enrollment
 
         # Check the current administrativestate
         - name: Get current administrativeState
@@ -440,7 +593,7 @@
             - "administrative state: {{administrative_state}}"
 
       when:
-        - not reconfig_flag
+        - not initial_config_done
         - deploy_config is defined
         - "'subcloud' in get_distributed_cloud_role.stdout"
         - "'unlocked' not in current_administrativestate.stdout"
@@ -573,7 +726,7 @@
                 wait_for:
                   timeout: 300
                 register: waiting_after_failures
-                ignore_errors: true
+                ignore_unreachable: true
 
               - name: Get post unlock state
                 shell: >-
@@ -614,8 +767,20 @@
             wait_for:
               timeout: "{{ boot_wait_time }}"
             register: waiting_after_reboot
+            # Unreachable: Ignore a task failure due to the host instance being ’UNREACHABLE’ 
+            # with the ignore_unreachable keyword. Ansible ignores the task errors but continues
+            # to execute future tasks against the unreachable host. This usually happens 
+            # if the host is network-inaccessible. For example, during a second reboot that
+            # temporarily disrupts SSH connectivity, Ansible will mark it as unreachable since 
+            # it can’t connect to the host at all.
+            ignore_unreachable: true
+            # Failed: It can ignore errors when the task is failed, except those syntax errors, 
+            # undefined variable errors, connection failures, execution issues.
+            # This occurs if Ansible can reach the host, but the task itself encounters an issue. This 
+            # could happen if the host is reachable but not fully ready to respond, or if a required
+            # port isn’t open yet.
             ignore_errors: true
-
+            
           # Retry block: sometimes system reboots twice
           # It will take some extra time.
           - block:
@@ -631,7 +796,7 @@
               delay: 20
 
             # Waiting task after unlock to catch the right status
-            - name: Wait for {{ boot_wait_time }} seconds to ensure not affecting host status
+            - name: Waiting after second reboot for {{ boot_wait_time }} seconds to ensure not affecting host status
               wait_for:
                 timeout: "{{ boot_wait_time }}"
               register: waiting_after_new_reboot
@@ -644,9 +809,9 @@
                   - "Then, use subcloud reconfig command to complete deployment"
               register: new_reboot
               when: waiting_after_new_reboot.failed
-
+ 
             when: waiting_after_reboot.failed
-
+ 
           - name: Set retries to check resource reconciled status for simplex
             set_fact:
               host_reconcile_retries: 80
@@ -699,9 +864,14 @@
 
           # After reboot, wait for resource reconciliation. This ensures the
           # playbook doesn't fail if resources are properly reconciled.
+          - name: Define resource list based on version
+            set_fact:
+              resources: "{{ 'systems,datanetworks,platformnetworks,ptpinstances,ptpinterfaces' if get_software_version.stdout < '24.09'
+                        else 'systems,datanetworks,platformnetworks,ptpinstances,ptpinterfaces,addresspools' }}"
+
           - name: Get not reconciled resource
             shell: >
-              (kubectl get systems,datanetworks,platformnetworks,addresspools,ptpinstances,ptpinterfaces
+              (kubectl get "{{ resources }}"
               -o custom-columns='NAME:.metadata.name,RECONCILED:.status.reconciled'
               -n deployment;
               kubectl -n deployment get hosts "{{ get_host_name.stdout }}" -o
@@ -777,7 +947,7 @@
                  and get_unrecon_status_post.stdout != "")
 
       when:
-        - not reconfig_flag
+        - not initial_config_done
         - deploy_config is defined
         - "'subcloud' in get_distributed_cloud_role.stdout"
         - "'unlocked' not in current_administrativestate.stdout"
